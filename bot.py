@@ -18,7 +18,6 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 
-# Загружаем .env по абсолютному пути (работает локально и на серверах)
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
@@ -26,17 +25,27 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID_RAW = os.getenv("ADMIN_ID")
 
 if not BOT_TOKEN:
-    raise ValueError("Критическая ошибка: BOT_TOKEN не найден в переменных окружения / .env файле!")
-
+    raise ValueError("Критическая ошибка: BOT_TOKEN не найден в .env!")
 if not ADMIN_ID_RAW:
-    raise ValueError("Критическая ошибка: ADMIN_ID не найден в переменных окружения / .env файле!")
+    raise ValueError("Критическая ошибка: ADMIN_ID не найден в .env!")
 
 ADMIN_ID = int(ADMIN_ID_RAW)
-DB_NAME = str(BASE_DIR / "tt_payouts.db")  # База создается в папке проекта
+DB_NAME = str(BASE_DIR / "tt_payouts.db")
 
-# ----------------- БАЗА ДАННЫХ ----------------- #
-# (далее весь остальной код остается без изменений)
+DEFAULT_GUIDE_TEXT = (
+    "📖 <b>Гайд и регламент по заливу TikTok</b>\n\n"
+    "<b>1. Требования к видео:</b>\n"
+    "• Формат: 9:16 (вертикально), 1080p, 30/60 fps.\n"
+    "• Длина: 7–15 секунд, динамичный монтаж.\n"
+    "• Звуки: актуальные тренды TikTok.\n"
+    "• Хэштеги: 3–5 штук по тематике.\n\n"
+    "<b>2. Тарифы и правила:</b>\n"
+    "• Ставка: <b>$1.00</b> за 1 000 просмотров и 100 лайков.\n"
+    "• Минимальный вывод: <b>$5.00</b>.\n"
+    "• Накрутка запрещена (бан без выплат)."
+)
 
+DEFAULT_WM_TEXT = "@your_project_tag (накладывать по центру или в углу)"
 
 # ----------------- БАЗА ДАННЫХ ----------------- #
 async def init_db():
@@ -48,7 +57,7 @@ async def init_db():
                 tt_username TEXT,
                 age INTEGER,
                 accounts_count INTEGER,
-                status TEXT DEFAULT 'unregistered', -- unregistered, pending, approved, rejected
+                status TEXT DEFAULT 'unregistered',
                 balance REAL DEFAULT 0.0,
                 referrer_id INTEGER DEFAULT NULL
             )
@@ -73,17 +82,65 @@ async def init_db():
                 status TEXT DEFAULT 'pending'
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        defaults = [
+            ("guide_text", DEFAULT_GUIDE_TEXT),
+            ("wm_text", DEFAULT_WM_TEXT),
+            ("wm_photo", ""),
+            ("example_views_photo", ""),
+            ("example_likes_photo", "")
+        ]
+        for key, val in defaults:
+            cursor = await db.execute("SELECT value FROM settings WHERE key = ?", (key,))
+            if not await cursor.fetchone():
+                await db.execute("INSERT INTO settings (key, value) VALUES (?, ?)", (key, val))
+        await db.commit()
+
+async def get_setting(key: str) -> str:
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute("SELECT value FROM settings WHERE key = ?", (key,))
+        row = await cursor.fetchone()
+        return row[0] if row else ""
+
+async def update_setting(key: str, value: str):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
         await db.commit()
 
 # ----------------- КЛАВИАТУРЫ ----------------- #
-def main_kb():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📹 Отправить отчет по видео")],
-            [KeyboardButton(text="💰 Баланс и Вывод"), KeyboardButton(text="👥 Реферальная система")],
-            [KeyboardButton(text="ℹ️ Профиль")]
-        ],
-        resize_keyboard=True
+def main_kb(user_id: int):
+    kb = [
+        [KeyboardButton(text="📹 Отправить отчет по видео")],
+        [KeyboardButton(text="📚 Гайд по видео"), KeyboardButton(text="💰 Баланс и Вывод")],
+        [KeyboardButton(text="👥 Реферальная система"), KeyboardButton(text="ℹ️ Профиль")]
+    ]
+    if user_id == ADMIN_ID:
+        kb.append([KeyboardButton(text="⚙️ Админ-панель гайдов")])
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+def guide_inline_kb():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🏷 Посмотреть водяной знак", callback_data="show_wm_info")],
+            [InlineKeyboardButton(text="🖼 Примеры правильных скриншотов", callback_data="show_examples_info")]
+        ]
+    )
+
+def admin_guides_menu_kb():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📝 Изменить текст регламента", callback_data="adm_edit_guide_text")],
+            [InlineKeyboardButton(text="🏷 Изменить текст вотермарка", callback_data="adm_edit_wm_text")],
+            [InlineKeyboardButton(text="🖼 Загрузить фото вотермарка/лого", callback_data="adm_upload_wm_photo")],
+            [InlineKeyboardButton(text="📊 Загрузить пример скрина просмотров", callback_data="adm_upload_views_sample")],
+            [InlineKeyboardButton(text="❤️ Загрузить пример скрина лайков", callback_data="adm_upload_likes_sample")],
+            [InlineKeyboardButton(text="❌ Закрыть", callback_data="cancel_action")]
+        ]
     )
 
 def withdraw_methods_kb():
@@ -118,6 +175,13 @@ class Withdrawal(StatesGroup):
     amount = State()
     details = State()
 
+class AdminSettingsState(StatesGroup):
+    waiting_guide_text = State()
+    waiting_wm_text = State()
+    waiting_wm_photo = State()
+    waiting_views_sample = State()
+    waiting_likes_sample = State()
+
 # ----------------- ИНИЦИАЛИЗАЦИЯ ----------------- #
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -144,7 +208,7 @@ async def cmd_start(message: Message, state: FSMContext):
             )
             await db.commit()
             await message.answer(
-                "👋 Привет! Чтобы начать работать и заливать видео, заполни короткую заявку.\n\n"
+                "👋 Привет! Чтобы начать работать и заливать видео, заполни заявку.\n\n"
                 "Введите ваш @username в TikTok:"
             )
             await state.set_state(Registration.tt_username)
@@ -155,11 +219,11 @@ async def cmd_start(message: Message, state: FSMContext):
             await message.answer("Введите ваш @username в TikTok:")
             await state.set_state(Registration.tt_username)
         elif status == "pending":
-            await message.answer("⏳ Ваша анкета находится на проверке у администратора. Ожидайте.")
+            await message.answer("⏳ Ваша заявка находится на рассмотрении. Ожидайте подтверждения.")
         elif status == "approved":
-            await message.answer("Главное меню:", reply_markup=main_kb())
+            await message.answer("Главное меню:", reply_markup=main_kb(message.from_user.id))
         elif status == "rejected":
-            await message.answer("❌ Ваша прошлая заявка была отклонена.")
+            await message.answer("❌ Ваша прошлая анкета была отклонена.")
 
 @dp.message(Registration.tt_username)
 async def reg_tt_username(message: Message, state: FSMContext):
@@ -170,16 +234,16 @@ async def reg_tt_username(message: Message, state: FSMContext):
 @dp.message(Registration.age)
 async def reg_age(message: Message, state: FSMContext):
     if not message.text.isdigit():
-        await message.answer("Пожалуйста, введите возраст числом:")
+        await message.answer("Пожалуйста, укажите возраст числом:")
         return
     await state.update_data(age=int(message.text))
-    await message.answer("Сколько TikTok аккаунтов вы готовы держать и вести одновременно?")
+    await message.answer("Сколько TikTok аккаунтов вы готовы вести одновременно?")
     await state.set_state(Registration.accounts_count)
 
 @dp.message(Registration.accounts_count)
 async def reg_accounts(message: Message, state: FSMContext):
     if not message.text.isdigit():
-        await message.answer("Введите количество числом:")
+        await message.answer("Укажите число:")
         return
 
     accs = int(message.text)
@@ -193,9 +257,8 @@ async def reg_accounts(message: Message, state: FSMContext):
         )
         await db.commit()
 
-    await message.answer("✅ Ваша анкета отправлена! Ожидайте подтверждения от модератора.")
+    await message.answer("✅ Заявка отправлена модератору на проверку!")
 
-    # Оповещение администратора
     admin_kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="✅ Принять", callback_data=f"appr_user_{message.from_user.id}"),
@@ -204,16 +267,15 @@ async def reg_accounts(message: Message, state: FSMContext):
     ])
     await bot.send_message(
         ADMIN_ID,
-        f"📝 <b>Новая анкета воркера:</b>\n"
-        f"TG: @{message.from_user.username or 'без_юзернейма'} (ID: {message.from_user.id})\n"
+        f"📝 <b>Новая заявка воркера:</b>\n"
+        f"TG: @{message.from_user.username or 'без_юзернейма'} (ID: <code>{message.from_user.id}</code>)\n"
         f"TikTok: {data['tt_username']}\n"
         f"Возраст: {data['age']}\n"
-        f"Готов держать аккаунтов: {accs}",
+        f"Аккаунтов: {accs}",
         reply_markup=admin_kb,
         parse_mode="HTML"
     )
 
-# ----------------- ОБРАБОТКА АНКЕТЫ АДМИНОМ ----------------- #
 @dp.callback_query(F.data.startswith("appr_user_"))
 async def admin_approve_user(callback: CallbackQuery):
     target_id = int(callback.data.split("_")[2])
@@ -222,7 +284,7 @@ async def admin_approve_user(callback: CallbackQuery):
         await db.commit()
 
     await callback.message.edit_text(callback.message.text + "\n\n✅ <b>Одобрен</b>", parse_mode="HTML")
-    await bot.send_message(target_id, "🎉 Ваша заявка одобрена! Теперь вам доступен весь функционал.", reply_markup=main_kb())
+    await bot.send_message(target_id, "🎉 Ваша заявка одобрена! Ознакомьтесь с гайдом перед отправкой видео.", reply_markup=main_kb(target_id))
 
 @dp.callback_query(F.data.startswith("decl_user_"))
 async def admin_decline_user(callback: CallbackQuery):
@@ -232,7 +294,151 @@ async def admin_decline_user(callback: CallbackQuery):
         await db.commit()
 
     await callback.message.edit_text(callback.message.text + "\n\n❌ <b>Отклонен</b>", parse_mode="HTML")
-    await bot.send_message(target_id, "❌ Ваша заявка на работу была отклонена модератором.")
+    await bot.send_message(target_id, "❌ Ваша анкета отклонена модератором.")
+
+# ----------------- ПРОСМОТР ГАЙДА ВОРКЕРАМИ ----------------- #
+@dp.message(F.text == "📚 Гайд по видео")
+async def show_guide(message: Message):
+    guide_text = await get_setting("guide_text")
+    await message.answer(guide_text, reply_markup=guide_inline_kb(), parse_mode="HTML", disable_web_page_preview=True)
+
+@dp.callback_query(F.data == "show_wm_info")
+async def callback_show_wm_info(callback: CallbackQuery):
+    wm_text = await get_setting("wm_text")
+    wm_photo = await get_setting("wm_photo")
+
+    caption = (
+        f"🏷 <b>Информация о водяном знаке (Watermark):</b>\n\n"
+        f"Текст/тег знака:\n<code>{wm_text}</code>\n\n"
+        f"⚠️ Обязательно накладывайте его на каждый ролик перед публикацией."
+    )
+    if wm_photo:
+        await callback.message.answer_photo(photo=wm_photo, caption=caption, parse_mode="HTML")
+    else:
+        await callback.message.answer(caption, parse_mode="HTML")
+    await callback.answer()
+
+@dp.callback_query(F.data == "show_examples_info")
+async def callback_show_examples(callback: CallbackQuery):
+    views_photo = await get_setting("example_views_photo")
+    likes_photo = await get_setting("example_likes_photo")
+
+    if not views_photo and not likes_photo:
+        await callback.answer("Администратор еще не загрузил образцы скриншотов.", show_alert=True)
+        return
+
+    if views_photo:
+        await callback.message.answer_photo(photo=views_photo, caption="📊 <b>Пример правильного скриншота просмотров</b>\nДолжно быть четко видно число просмотров и аккаунт.", parse_mode="HTML")
+    if likes_photo:
+        await callback.message.answer_photo(photo=likes_photo, caption="❤️ <b>Пример правильного скриншота лайков</b>\nДолжно быть четко видно количество отметок «Нравится».", parse_mode="HTML")
+    await callback.answer()
+
+# ----------------- АДМИН-ПАНЕЛЬ УПРАВЛЕНИЯ ГАЙДАМИ ----------------- #
+@dp.message(F.text == "⚙️ Админ-панель гайдов")
+@dp.message(Command("admin"))
+async def cmd_admin_guides(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await message.answer(
+        "🛠 <b>Управление гайдами и регламентом:</b>\n\n"
+        "Выберите раздел, который хотите обновить:",
+        reply_markup=admin_guides_menu_kb(),
+        parse_mode="HTML"
+    )
+
+@dp.callback_query(F.data == "adm_edit_guide_text")
+async def adm_edit_guide_start(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    current_text = await get_setting("guide_text")
+    await callback.message.answer(
+        f"Текущий текст гайда:\n\n{current_text}\n\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"Отправьте сообщением <b>новый текст регламента</b> (поддерживается HTML-разметка):",
+        parse_mode="HTML"
+    )
+    await state.set_state(AdminSettingsState.waiting_guide_text)
+    await callback.answer()
+
+@dp.message(AdminSettingsState.waiting_guide_text)
+async def adm_save_guide_text(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await update_setting("guide_text", message.text)
+    await state.clear()
+    await message.answer("✅ Основной текст регламента успешно обновлен!", reply_markup=main_kb(ADMIN_ID))
+
+@dp.callback_query(F.data == "adm_edit_wm_text")
+async def adm_edit_wm_start(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    cur_wm = await get_setting("wm_text")
+    await callback.message.answer(
+        f"Текущий вотермарк: <code>{cur_wm}</code>\n\n"
+        f"Отправьте новый текст/тег водяного знака:",
+        parse_mode="HTML"
+    )
+    await state.set_state(AdminSettingsState.waiting_wm_text)
+    await callback.answer()
+
+@dp.message(AdminSettingsState.waiting_wm_text)
+async def adm_save_wm_text(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await update_setting("wm_text", message.text.strip())
+    await state.clear()
+    await message.answer("✅ Текст водяного знака обновлен!", reply_markup=main_kb(ADMIN_ID))
+
+@dp.callback_query(F.data == "adm_upload_wm_photo")
+async def adm_upload_wm_photo_start(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    await callback.message.answer("Отправьте фото или логотип водяного знака, который воркеры должны накладывать:")
+    await state.set_state(AdminSettingsState.waiting_wm_photo)
+    await callback.answer()
+
+@dp.message(AdminSettingsState.waiting_wm_photo, F.photo)
+async def adm_save_wm_photo(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    photo_id = message.photo[-1].file_id
+    await update_setting("wm_photo", photo_id)
+    await state.clear()
+    await message.answer("✅ Картинка водяного знака сохранена!", reply_markup=main_kb(ADMIN_ID))
+
+@dp.callback_query(F.data == "adm_upload_views_sample")
+async def adm_upload_views_sample_start(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    await callback.message.answer("Отправьте фото-образец скриншота просмотров:")
+    await state.set_state(AdminSettingsState.waiting_views_sample)
+    await callback.answer()
+
+@dp.message(AdminSettingsState.waiting_views_sample, F.photo)
+async def adm_save_views_sample(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    photo_id = message.photo[-1].file_id
+    await update_setting("example_views_photo", photo_id)
+    await state.clear()
+    await message.answer("✅ Образец скриншота просмотров сохранен!", reply_markup=main_kb(ADMIN_ID))
+
+@dp.callback_query(F.data == "adm_upload_likes_sample")
+async def adm_upload_likes_sample_start(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    await callback.message.answer("Отправьте фото-образец скриншота лайков:")
+    await state.set_state(AdminSettingsState.waiting_likes_sample)
+    await callback.answer()
+
+@dp.message(AdminSettingsState.waiting_likes_sample, F.photo)
+async def adm_save_likes_sample(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    photo_id = message.photo[-1].file_id
+    await update_setting("example_likes_photo", photo_id)
+    await state.clear()
+    await message.answer("✅ Образец скриншота лайков сохранен!", reply_markup=main_kb(ADMIN_ID))
 
 # ----------------- ПРОФИЛЬ И РЕФЕРАЛЫ ----------------- #
 @dp.message(F.text == "ℹ️ Профиль")
@@ -263,9 +469,9 @@ async def cmd_refs(message: Message):
 
     await message.answer(
         f"👥 <b>Реферальная программа (15%):</b>\n\n"
-        f"Приглашайте воркеров и получайте 15% от каждой начисленной им суммы за просмотры!\n\n"
-        f"Ваша ссылка:\n<code>{ref_link}</code>\n\n"
-        f"Всего рефералов: <b>{refs_count}</b>",
+        f"Вы получаете 15% от выплат каждого приглашенного воркера.\n\n"
+        f"Ваша партнерская ссылка:\n<code>{ref_link}</code>\n\n"
+        f"Приглашено рефералов: <b>{refs_count}</b>",
         parse_mode="HTML"
     )
 
@@ -277,27 +483,27 @@ async def report_start(message: Message, state: FSMContext):
         user = await cursor.fetchone()
 
     if not user or user[0] != 'approved':
-        await message.answer("⚠️ Вы еще не прошли модерацию.")
+        await message.answer("⚠️ Ваша заявка еще не одобрена.")
         return
 
-    await message.answer("Отправьте прямую ссылку на ваше TikTok видео:")
+    await message.answer("Отправьте ссылку на ваше опубликованное видео в TikTok:")
     await state.set_state(VideoReport.url)
 
 @dp.message(VideoReport.url)
 async def report_url(message: Message, state: FSMContext):
     if not message.text.startswith("http"):
-        await message.answer("Пожалуйста, отправьте корректную ссылку:")
+        await message.answer("Отправьте валидную ссылку (начинается с http/https):")
         return
 
     await state.update_data(video_url=message.text.strip())
-    await message.answer("Прикрепите скриншот, подтверждающий количество просмотров:")
+    await message.answer("Отправьте скриншот просмотров из аналитики видео:")
     await state.set_state(VideoReport.views_photo)
 
 @dp.message(VideoReport.views_photo, F.photo)
 async def report_views_photo(message: Message, state: FSMContext):
     photo_id = message.photo[-1].file_id
     await state.update_data(views_photo_id=photo_id)
-    await message.answer("Отлично! Теперь отправьте скриншот лайков к видео:")
+    await message.answer("Теперь отправьте скриншот лайков:")
     await state.set_state(VideoReport.likes_photo)
 
 @dp.message(VideoReport.likes_photo, F.photo)
@@ -314,9 +520,8 @@ async def report_likes_photo(message: Message, state: FSMContext):
         report_id = (await cursor.fetchone())[0]
         await db.commit()
 
-    await message.answer("✅ Отчет принят и отправлен модератору на проверку!", reply_markup=main_kb())
+    await message.answer("✅ Отчет принят и отправлен на модерацию!", reply_markup=main_kb(message.from_user.id))
 
-    # Отправка администратору
     admin_kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="💵 Начислить баланс", callback_data=f"pay_rep_{report_id}"),
@@ -331,8 +536,8 @@ async def report_likes_photo(message: Message, state: FSMContext):
         f"Ссылка: {data['video_url']}",
         parse_mode="HTML"
     )
-    await bot.send_photo(ADMIN_ID, photo=data['views_photo_id'], caption=f"Скриншот просмотров (Отчет #{report_id})")
-    await bot.send_photo(ADMIN_ID, photo=photo_id, caption=f"Скриншот лайков (Отчет #{report_id})", reply_markup=admin_kb)
+    await bot.send_photo(ADMIN_ID, photo=data['views_photo_id'], caption=f"Просмотры (Отчет #{report_id})")
+    await bot.send_photo(ADMIN_ID, photo=photo_id, caption=f"Лайки (Отчет #{report_id})", reply_markup=admin_kb)
 
 # ----------------- МОДЕРАЦИЯ ОТЧЕТА ----------------- #
 @dp.callback_query(F.data.startswith("rej_rep_"))
@@ -347,7 +552,7 @@ async def admin_reject_report(callback: CallbackQuery):
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.answer(f"❌ Отчет #{report_id} отклонен.")
     if rep:
-        await bot.send_message(rep[0], f"❌ Ваш отчет по видео #{report_id} был отклонен модератором.")
+        await bot.send_message(rep[0], f"❌ Ваш отчет #{report_id} отклонен. Убедитесь, что соблюден регламент, водяной знак и скриншоты.")
 
 @dp.callback_query(F.data.startswith("pay_rep_"))
 async def admin_pay_report_start(callback: CallbackQuery, state: FSMContext):
@@ -359,7 +564,7 @@ async def admin_pay_report_start(callback: CallbackQuery, state: FSMContext):
 @dp.message(AdminReview.views)
 async def admin_review_views(message: Message, state: FSMContext):
     if not message.text.isdigit():
-        await message.answer("Введите целое число просмотров:")
+        await message.answer("Введите число просмотров:")
         return
     await state.update_data(views=int(message.text))
     await message.answer("Введите подтвержденное количество лайков:")
@@ -368,7 +573,7 @@ async def admin_review_views(message: Message, state: FSMContext):
 @dp.message(AdminReview.likes)
 async def admin_review_likes(message: Message, state: FSMContext):
     if not message.text.isdigit():
-        await message.answer("Введите целое число лайков:")
+        await message.answer("Введите число лайков:")
         return
 
     data = await state.get_data()
@@ -378,8 +583,6 @@ async def admin_review_likes(message: Message, state: FSMContext):
     likes = int(message.text)
     report_id = data['report_id']
 
-    # Расчет: $1 за 1000 просмотров и 100 лайков ($0.001 за просмотр при базовом соотношении)
-    # Пропорциональный подсчет по просмотрам:
     amount = round((views / 1000.0) * 1.0, 2)
 
     async with aiosqlite.connect(DB_NAME) as db:
@@ -390,14 +593,11 @@ async def admin_review_likes(message: Message, state: FSMContext):
             return
 
         worker_id = rep[0]
-        # Обновляем статус отчета и баланс воркера
         await db.execute("UPDATE video_reports SET status = 'approved' WHERE id = ?", (report_id,))
         await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, worker_id))
 
-        # Реферальный бонус (15%)
         ref_cursor = await db.execute("SELECT referrer_id FROM users WHERE user_id = ?", (worker_id,))
         user_ref = await ref_cursor.fetchone()
-        ref_payout = 0.0
 
         if user_ref and user_ref[0]:
             referrer_id = user_ref[0]
@@ -406,18 +606,18 @@ async def admin_review_likes(message: Message, state: FSMContext):
                 await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (ref_payout, referrer_id))
                 await bot.send_message(
                     referrer_id,
-                    f"🎁 <b>Реферальный бонус!</b>\nВам начислено <b>${ref_payout:.2f}</b> (15%) от работы вашего реферала.",
+                    f"🎁 <b>Реферальный бонус!</b>\nВам начислено <b>${ref_payout:.2f}</b> (15%) от видео реферала.",
                     parse_mode="HTML"
                 )
 
         await db.commit()
 
-    await message.answer(f"✅ Баланс воркера пополнен на ${amount:.2f}. Отчет закрыт.")
+    await message.answer(f"✅ Баланс воркера пополнен на ${amount:.2f}. Отчет #{report_id} закрыт.")
     await bot.send_message(
         worker_id,
         f"🎉 <b>Отчет одобрен!</b>\n"
         f"Просмотры: {views} | Лайки: {likes}\n"
-        f"Вам начислено: <b>${amount:.2f}</b>",
+        f"Начислено: <b>${amount:.2f}</b>",
         parse_mode="HTML"
     )
 
@@ -433,8 +633,8 @@ async def cmd_balance(message: Message):
         [InlineKeyboardButton(text="📤 Заказать вывод (от $5)", callback_data="start_withdraw")]
     ])
     await message.answer(
-        f"💰 Ваш текущий баланс: <b>${balance:.2f}</b>\n\n"
-        f"Минимальная сумма на вывод: <b>$5.00</b>",
+        f"💰 Ваш баланс: <b>${balance:.2f}</b>\n\n"
+        f"Минимальная выплата: <b>$5.00</b>",
         reply_markup=kb,
         parse_mode="HTML"
     )
@@ -446,10 +646,10 @@ async def withdraw_start(callback: CallbackQuery, state: FSMContext):
         balance = (await cursor.fetchone())[0]
 
     if balance < 5.0:
-        await callback.answer("❌ На балансе меньше $5. Минимальная выплата — 5$", show_alert=True)
+        await callback.answer("❌ На балансе меньше $5. Вывод доступен от $5.", show_alert=True)
         return
 
-    await callback.message.edit_text("Выберите платежную систему для вывода:", reply_markup=withdraw_methods_kb())
+    await callback.message.edit_text("Выберите метод вывода:", reply_markup=withdraw_methods_kb())
 
 @dp.callback_query(F.data.startswith("wm_"))
 async def withdraw_select_method(callback: CallbackQuery, state: FSMContext):
@@ -462,7 +662,7 @@ async def withdraw_select_method(callback: CallbackQuery, state: FSMContext):
     method_name = methods_dict[callback.data]
     await state.update_data(withdraw_method=method_name)
 
-    await callback.message.edit_text(f"Выбран метод: <b>{method_name}</b>\nВведите сумму вывода в долларах ($):", parse_mode="HTML")
+    await callback.message.edit_text(f"Метод: <b>{method_name}</b>\nВведите сумму вывода ($):", parse_mode="HTML")
     await state.set_state(Withdrawal.amount)
 
 @dp.message(Withdrawal.amount)
@@ -470,11 +670,11 @@ async def withdraw_amount(message: Message, state: FSMContext):
     try:
         amount = float(message.text.replace(",", "."))
     except ValueError:
-        await message.answer("Введите сумму корректным числом:")
+        await message.answer("Введите сумму числом:")
         return
 
     if amount < 5.0:
-        await message.answer("Минимальная сумма вывода — $5. Введите сумму еще раз:")
+        await message.answer("Минимальная сумма — $5. Введите сумму заново:")
         return
 
     async with aiosqlite.connect(DB_NAME) as db:
@@ -482,11 +682,11 @@ async def withdraw_amount(message: Message, state: FSMContext):
         balance = (await cursor.fetchone())[0]
 
     if amount > balance:
-        await message.answer(f"Недостаточно средств. Ваш баланс: ${balance:.2f}\nВведите другую сумму:")
+        await message.answer(f"Недостаточно средств. Ваш баланс: ${balance:.2f}\nВведите корректную сумму:")
         return
 
     await state.update_data(amount=amount)
-    await message.answer("Введите ваши реквизиты (номер карты, кошелька или адрес TON):")
+    await message.answer("Введите реквизиты (номер карты / адрес TON / номер счета):")
     await state.set_state(Withdrawal.details)
 
 @dp.message(Withdrawal.details)
@@ -498,7 +698,6 @@ async def withdraw_details(message: Message, state: FSMContext):
     await state.clear()
 
     async with aiosqlite.connect(DB_NAME) as db:
-        # Списываем баланс в холдер
         await db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (amount, message.from_user.id))
         cursor = await db.execute(
             "INSERT INTO withdrawals (user_id, amount, method, details) VALUES (?, ?, ?, ?) RETURNING id",
@@ -508,21 +707,22 @@ async def withdraw_details(message: Message, state: FSMContext):
         await db.commit()
 
     await message.answer(
-        f"✅ <b>Заявка на вывод #{withdraw_id} создана!</b>\n"
-        f"Сумма: ${amount:.2f}\nМетод: {method}\nРеквизиты: {details}\n\n"
-        f"Ожидайте поступления средств на счет.",
-        reply_markup=main_kb(),
+        f"✅ <b>Заявка на вывод #{withdraw_id} принята!</b>\n"
+        f"Сумма: ${amount:.2f}\n"
+        f"Метод: {method}\n"
+        f"Реквизиты: {details}\n\n"
+        f"Ожидайте зачисления средств.",
+        reply_markup=main_kb(message.from_user.id),
         parse_mode="HTML"
     )
 
-    # Уведомление администратору
     admin_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Выплачено", callback_data=f"done_wdr_{withdraw_id}")]
     ])
     await bot.send_message(
         ADMIN_ID,
-        f"💸 <b>Заявка на вывод средств #{withdraw_id}</b>\n\n"
-        f"Пользователь: @{message.from_user.username or 'нет'} (ID: <code>{message.from_user.id}</code>)\n"
+        f"💸 <b>Заявка на вывод #{withdraw_id}</b>\n\n"
+        f"Воркер: @{message.from_user.username or 'без_юзернейма'} (ID: <code>{message.from_user.id}</code>)\n"
         f"Сумма: <b>${amount:.2f}</b>\n"
         f"Метод: <b>{method}</b>\n"
         f"Реквизиты: <code>{details}</code>",
@@ -543,7 +743,7 @@ async def admin_complete_withdraw(callback: CallbackQuery):
     if res:
         await bot.send_message(
             res[0],
-            f"✅ <b>Выплата выполнена!</b>\nВам отправлено ${res[1]:.2f} на {res[2]}.",
+            f"✅ <b>Выплата выполнена!</b>\nСредства (${res[1]:.2f}) отправлены на {res[2]}.",
             parse_mode="HTML"
         )
 
@@ -551,7 +751,7 @@ async def admin_complete_withdraw(callback: CallbackQuery):
 async def cancel_callback(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.delete()
-    await callback.message.answer("Действие отменено.", reply_markup=main_kb())
+    await callback.message.answer("Действие отменено.", reply_markup=main_kb(callback.from_user.id))
 
 # ----------------- ЗАПУСК ----------------- #
 async def main():
@@ -560,4 +760,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
