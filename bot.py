@@ -21,35 +21,26 @@ from aiogram.types import (
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID_RAW = os.getenv("ADMIN_ID")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_ID_STR = os.getenv("ADMIN_ID", "1602809044").strip()
+ADMIN_ID = int(ADMIN_ID_STR) if ADMIN_ID_STR.isdigit() else 1602809044
 
-if not BOT_TOKEN:
-    raise ValueError("Критическая ошибка: BOT_TOKEN не найден в .env!")
-if not ADMIN_ID_RAW:
-    raise ValueError("Критическая ошибка: ADMIN_ID не найден в .env!")
+DB_PATH = BASE_DIR / "tt_payouts.db"
 
-ADMIN_ID = int(ADMIN_ID_RAW)
-DB_NAME = str(BASE_DIR / "tt_payouts.db")
-
-DEFAULT_GUIDE_TEXT = (
-    "📖 <b>Гайд и регламент по заливу TikTok</b>\n\n"
-    "<b>1. Требования к видео:</b>\n"
-    "• Формат: 9:16 (вертикально), 1080p, 30/60 fps.\n"
-    "• Длина: 7–15 секунд, динамичный монтаж.\n"
-    "• Звуки: актуальные тренды TikTok.\n"
-    "• Хэштеги: 3–5 штук по тематике.\n\n"
-    "<b>2. Тарифы и правила:</b>\n"
-    "• Ставка: <b>$1.00</b> за 1 000 просмотров и 100 лайков.\n"
-    "• Минимальный вывод: <b>$5.00</b>.\n"
-    "• Накрутка запрещена (бан без выплат)."
+DEFAULT_GUIDE = (
+    "📖 <b>Регламент залива видео TikTok</b>\n\n"
+    "1. <b>Формат</b>: вертикальный 9:16 (1080x1920), 30/60 FPS, динамичный монтаж 7–15 секунд.\n"
+    "2. <b>Водяной знак</b>: обязателен на протяжении всего видео.\n"
+    "3. <b>Скриншоты</b>: четкие скрины просмотров и лайков из аналитики.\n"
+    "4. <b>Тариф</b>: $1.00 за 1 000 просмотров и 100 лайков.\n"
+    "5. <b>Выплаты</b>: от $5.00 на РФ карты, KZ карты, TON и USD."
 )
 
-DEFAULT_WM_TEXT = "@your_project_tag (накладывать по центру или в углу)"
+DEFAULT_WM = "@project_tag"
 
 # ----------------- БАЗА ДАННЫХ ----------------- #
 async def init_db():
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -63,695 +54,684 @@ async def init_db():
             )
         """)
         await db.execute("""
-            CREATE TABLE IF NOT EXISTS video_reports (
+            CREATE TABLE IF NOT EXISTS reports (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                video_url TEXT,
-                views_photo_id TEXT,
-                likes_photo_id TEXT,
+                user_id INTEGER NOT NULL,
+                video_url TEXT NOT NULL,
+                views_photo TEXT NOT NULL,
+                likes_photo TEXT NOT NULL,
                 status TEXT DEFAULT 'pending'
             )
         """)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS withdrawals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                amount REAL,
-                method TEXT,
-                details TEXT,
+                user_id INTEGER NOT NULL,
+                amount REAL NOT NULL,
+                method TEXT NOT NULL,
+                details TEXT NOT NULL,
                 status TEXT DEFAULT 'pending'
             )
         """)
         await db.execute("""
-            CREATE TABLE IF NOT EXISTS settings (
+            CREATE TABLE IF NOT EXISTS config (
                 key TEXT PRIMARY KEY,
-                value TEXT
+                val TEXT
             )
         """)
+
+        # Принудительно вносим или обновляем дефолтные значения
         defaults = [
-            ("guide_text", DEFAULT_GUIDE_TEXT),
-            ("wm_text", DEFAULT_WM_TEXT),
+            ("guide", DEFAULT_GUIDE),
+            ("wm_tag", DEFAULT_WM),
             ("wm_photo", ""),
-            ("example_views_photo", ""),
-            ("example_likes_photo", "")
+            ("sample_views", ""),
+            ("sample_likes", "")
         ]
         for key, val in defaults:
-            cursor = await db.execute("SELECT value FROM settings WHERE key = ?", (key,))
-            if not await cursor.fetchone():
-                await db.execute("INSERT INTO settings (key, value) VALUES (?, ?)", (key, val))
+            await db.execute("INSERT OR IGNORE INTO config (key, val) VALUES (?, ?)", (key, val))
+
+        # Сразу делаем админа одобренным
+        await db.execute("""
+            INSERT INTO users (user_id, username, status)
+            VALUES (?, 'admin', 'approved')
+            ON CONFLICT(user_id) DO UPDATE SET status = 'approved'
+        """, (ADMIN_ID,))
+
         await db.commit()
 
-async def get_setting(key: str) -> str:
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("SELECT value FROM settings WHERE key = ?", (key,))
-        row = await cursor.fetchone()
-        return row[0] if row else ""
+async def get_config(key: str) -> str:
+    async with aiosqlite.connect(DB_PATH) as db:
+        res = await db.execute("SELECT val FROM config WHERE key = ?", (key,))
+        row = await res.fetchone()
+        return row[0] if (row and row[0]) else ""
 
-async def update_setting(key: str, value: str):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+async def set_config(key: str, val: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR REPLACE INTO config (key, val) VALUES (?, ?)", (key, val))
         await db.commit()
 
 # ----------------- КЛАВИАТУРЫ ----------------- #
 def main_kb(user_id: int):
-    kb = [
-        [KeyboardButton(text="📹 Отправить отчет по видео")],
-        [KeyboardButton(text="📚 Гайд по видео"), KeyboardButton(text="💰 Баланс и Вывод")],
-        [KeyboardButton(text="👥 Реферальная система"), KeyboardButton(text="ℹ️ Профиль")]
-    ]
     if user_id == ADMIN_ID:
-        kb.append([KeyboardButton(text="⚙️ Админ-панель гайдов")])
-    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+        return ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="⚙️ Админ-панель")],
+                [KeyboardButton(text="📚 Регламент и Гайды"), KeyboardButton(text="💰 Баланс")],
+                [KeyboardButton(text="📹 Сдать отчет"), KeyboardButton(text="👥 Рефералка")]
+            ],
+            resize_keyboard=True
+        )
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📹 Сдать отчет")],
+            [KeyboardButton(text="📚 Регламент и Гайды"), KeyboardButton(text="💰 Баланс")],
+            [KeyboardButton(text="👥 Рефералка"), KeyboardButton(text="👤 Профиль")]
+        ],
+        resize_keyboard=True
+    )
 
 def guide_inline_kb():
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🏷 Посмотреть водяной знак", callback_data="show_wm_info")],
-            [InlineKeyboardButton(text="🖼 Примеры правильных скриншотов", callback_data="show_examples_info")]
+            [InlineKeyboardButton(text="🏷 Водяной знак", callback_data="show_wm")],
+            [InlineKeyboardButton(text="🖼 Примеры скриншотов", callback_data="show_samples")]
         ]
     )
 
-def admin_guides_menu_kb():
+def admin_menu_kb():
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📝 Изменить текст регламента", callback_data="adm_edit_guide_text")],
-            [InlineKeyboardButton(text="🏷 Изменить текст вотермарка", callback_data="adm_edit_wm_text")],
-            [InlineKeyboardButton(text="🖼 Загрузить фото вотермарка/лого", callback_data="adm_upload_wm_photo")],
-            [InlineKeyboardButton(text="📊 Загрузить пример скрина просмотров", callback_data="adm_upload_views_sample")],
-            [InlineKeyboardButton(text="❤️ Загрузить пример скрина лайков", callback_data="adm_upload_likes_sample")],
-            [InlineKeyboardButton(text="❌ Закрыть", callback_data="cancel_action")]
+            [InlineKeyboardButton(text="📝 Изменить текст гайда", callback_data="adm_set_guide")],
+            [InlineKeyboardButton(text="🏷 Изменить тег вотермарка", callback_data="adm_set_wmtag")],
+            [InlineKeyboardButton(text="🖼 Загрузить лого/фото знака", callback_data="adm_set_wmphoto")],
+            [InlineKeyboardButton(text="📊 Образец просмотров", callback_data="adm_set_sample_views")],
+            [InlineKeyboardButton(text="❤️ Образец лайков", callback_data="adm_set_sample_likes")],
+            [InlineKeyboardButton(text="❌ Закрыть панель", callback_data="close_admin")]
         ]
     )
 
-def withdraw_methods_kb():
+def cancel_kb():
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🇷🇺 Карта РФ (RUB)", callback_data="wm_rub")],
-            [InlineKeyboardButton(text="🇰🇿 Карта KZ (KZT)", callback_data="wm_kzt")],
-            [InlineKeyboardButton(text="💎 TON (Крипта)", callback_data="wm_ton")],
-            [InlineKeyboardButton(text="💵 USD", callback_data="wm_usd")],
             [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
         ]
     )
 
 # ----------------- FSM СОСТОЯНИЯ ----------------- #
-class Registration(StatesGroup):
+class WorkerReg(StatesGroup):
     tt_username = State()
     age = State()
-    accounts_count = State()
+    accounts = State()
 
-class VideoReport(StatesGroup):
+class ReportFSM(StatesGroup):
     url = State()
     views_photo = State()
     likes_photo = State()
 
-class AdminReview(StatesGroup):
+class AdminReviewFSM(StatesGroup):
     report_id = State()
     views = State()
     likes = State()
 
-class Withdrawal(StatesGroup):
+class WithdrawFSM(StatesGroup):
     method = State()
     amount = State()
     details = State()
 
-class AdminSettingsState(StatesGroup):
-    waiting_guide_text = State()
-    waiting_wm_text = State()
-    waiting_wm_photo = State()
-    waiting_views_sample = State()
-    waiting_likes_sample = State()
+class AdminEditFSM(StatesGroup):
+    text_data = State()
+    photo_data = State()
 
 # ----------------- ИНИЦИАЛИЗАЦИЯ ----------------- #
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# ----------------- СТАРТ И РЕГИСТРАЦИЯ ----------------- #
+# ----------------- СТАРТ ----------------- #
 @dp.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext):
+@dp.message(Command("reset_admin"))
+async def start_handler(message: Message, state: FSMContext):
     await state.clear()
-    args = message.text.split(maxsplit=1)
-    referrer_id = None
-    if len(args) > 1 and args[1].isdigit():
-        ref_candidate = int(args[1])
-        if ref_candidate != message.from_user.id:
-            referrer_id = ref_candidate
+    uid = message.from_user.id
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("SELECT status FROM users WHERE user_id = ?", (message.from_user.id,))
-        user = await cursor.fetchone()
+    # ЖЕСТКАЯ ПРОВЕРКА АДМИНА
+    if uid == ADMIN_ID:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET status = 'approved' WHERE user_id = ?", (uid,))
+            await db.commit()
+        await message.answer("👑 Вы авторизованы как Администратор проекта.", reply_markup=main_kb(uid))
+        return
+
+    # ОБЫЧНЫЙ ПОЛЬЗОВАТЕЛЬ
+    ref_id = None
+    parts = message.text.split(maxsplit=1)
+    if len(parts) > 1 and parts[1].isdigit():
+        ref_candidate = int(parts[1])
+        if ref_candidate != uid:
+            ref_id = ref_candidate
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        res = await db.execute("SELECT status FROM users WHERE user_id = ?", (uid,))
+        user = await res.fetchone()
 
         if not user:
             await db.execute(
                 "INSERT INTO users (user_id, username, referrer_id) VALUES (?, ?, ?)",
-                (message.from_user.id, message.from_user.username, referrer_id)
+                (uid, message.from_user.username, ref_id)
             )
             await db.commit()
             await message.answer(
-                "👋 Привет! Чтобы начать работать и заливать видео, заполни заявку.\n\n"
-                "Введите ваш @username в TikTok:"
+                "👋 Привет! Чтобы начать заливать видео и получать выплаты, ответьте на пару вопросов.\n\n"
+                "Введите ваш TikTok username (например: @username):"
             )
-            await state.set_state(Registration.tt_username)
+            await state.set_state(WorkerReg.tt_username)
             return
 
         status = user[0]
-        if status == "unregistered":
-            await message.answer("Введите ваш @username в TikTok:")
-            await state.set_state(Registration.tt_username)
+        if status == "approved":
+            await message.answer("Главное меню:", reply_markup=main_kb(uid))
         elif status == "pending":
-            await message.answer("⏳ Ваша заявка находится на рассмотрении. Ожидайте подтверждения.")
-        elif status == "approved":
-            await message.answer("Главное меню:", reply_markup=main_kb(message.from_user.id))
+            await message.answer("⏳ Ваша анкета находится на проверке. Ожидайте решения модератора.")
         elif status == "rejected":
-            await message.answer("❌ Ваша прошлая анкета была отклонена.")
+            await message.answer("❌ Ваша заявка отклонена администрацией.")
+        else:
+            await message.answer("Введите ваш TikTok username:")
+            await state.set_state(WorkerReg.tt_username)
 
-@dp.message(Registration.tt_username)
-async def reg_tt_username(message: Message, state: FSMContext):
+# ----------------- АДМИН-ПАНЕЛЬ И НАСТРОЙКИ ----------------- #
+@dp.message(F.text == "⚙️ Админ-панель")
+@dp.message(Command("admin"))
+async def open_admin_panel(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.clear()
+    await message.answer("⚙️ <b>Панель управления материалами и гайдами:</b>", reply_markup=admin_menu_kb(), parse_mode="HTML")
+
+@dp.callback_query(F.data == "close_admin")
+async def close_admin(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.delete()
+
+@dp.callback_query(F.data.in_({"adm_set_guide", "adm_set_wmtag"}))
+async def admin_set_text_start(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return
+    key = "guide" if call.data == "adm_set_guide" else "wm_tag"
+    await state.update_data(target_key=key)
+
+    cur = await get_config(key)
+    await call.message.answer(
+        f"Текущее значение <b>{key}</b>:\n\n{cur}\n\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"Отправьте новым сообщением текст для сохранения:",
+        parse_mode="HTML",
+        reply_markup=cancel_kb()
+    )
+    await state.set_state(AdminEditFSM.text_data)
+    await call.answer()
+
+@dp.message(AdminEditFSM.text_data)
+async def admin_save_text(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    data = await state.get_data()
+    key = data.get("target_key")
+    await set_config(key, message.text)
+    await state.clear()
+    await message.answer(f"✅ Настройка <b>{key}</b> успешно обновлена!", parse_mode="HTML", reply_markup=main_kb(ADMIN_ID))
+
+@dp.callback_query(F.data.in_({"adm_set_wmphoto", "adm_set_sample_views", "adm_set_sample_likes"}))
+async def admin_set_photo_start(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return
+    mapping = {
+        "adm_set_wmphoto": "wm_photo",
+        "adm_set_sample_views": "sample_views",
+        "adm_set_sample_likes": "sample_likes"
+    }
+    key = mapping[call.data]
+    await state.update_data(target_key=key)
+    await call.message.answer(f"Отправьте фотографию для раздела <b>{key}</b>:", parse_mode="HTML", reply_markup=cancel_kb())
+    await state.set_state(AdminEditFSM.photo_data)
+    await call.answer()
+
+@dp.message(AdminEditFSM.photo_data, F.photo)
+async def admin_save_photo(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    data = await state.get_data()
+    key = data.get("target_key")
+    photo_id = message.photo[-1].file_id
+    await set_config(key, photo_id)
+    await state.clear()
+    await message.answer(f"✅ Изображение для <b>{key}</b> успешно сохранено!", parse_mode="HTML", reply_markup=main_kb(ADMIN_ID))
+
+# ----------------- ПРОСМОТР ГАЙДА ----------------- #
+@dp.message(F.text == "📚 Регламент и Гайды")
+async def show_guide(message: Message):
+    text = await get_config("guide")
+    if not text:
+        text = DEFAULT_GUIDE
+    await message.answer(text, reply_markup=guide_inline_kb(), parse_mode="HTML", disable_web_page_preview=True)
+
+@dp.callback_query(F.data == "show_wm")
+async def show_wm(call: CallbackQuery):
+    tag = await get_config("wm_tag")
+    photo = await get_config("wm_photo")
+    caption = f"🏷 <b>Водяной знак:</b> <code>{tag or DEFAULT_WM}</code>\n\nНакладывайте его поверх каждого видео."
+    if photo:
+        await call.message.answer_photo(photo=photo, caption=caption, parse_mode="HTML")
+    else:
+        await call.message.answer(caption, parse_mode="HTML")
+    await call.answer()
+
+@dp.callback_query(F.data == "show_samples")
+async def show_samples(call: CallbackQuery):
+    v_photo = await get_config("sample_views")
+    l_photo = await get_config("sample_likes")
+
+    if not v_photo and not l_photo:
+        await call.answer("Образцы скриншотов еще не загружены.", show_alert=True)
+        return
+
+    if v_photo:
+        await call.message.answer_photo(photo=v_photo, caption="📊 Пример скриншота <b>просмотров</b> из аналитики TikTok", parse_mode="HTML")
+    if l_photo:
+        await call.message.answer_photo(photo=l_photo, caption="❤️ Пример скриншота <b>лайков</b>", parse_mode="HTML")
+    await call.answer()
+
+# ----------------- АНКЕТА ВОРКЕРА ----------------- #
+@dp.message(WorkerReg.tt_username)
+async def worker_tt_step(message: Message, state: FSMContext):
+    if message.from_user.id == ADMIN_ID:
+        await state.clear()
+        await message.answer("👑 Вы администратор.", reply_markup=main_kb(ADMIN_ID))
+        return
     await state.update_data(tt_username=message.text.strip())
     await message.answer("Сколько вам лет?")
-    await state.set_state(Registration.age)
+    await state.set_state(WorkerReg.age)
 
-@dp.message(Registration.age)
-async def reg_age(message: Message, state: FSMContext):
+@dp.message(WorkerReg.age)
+async def worker_age_step(message: Message, state: FSMContext):
     if not message.text.isdigit():
-        await message.answer("Пожалуйста, укажите возраст числом:")
+        await message.answer("Введите число:")
         return
     await state.update_data(age=int(message.text))
-    await message.answer("Сколько TikTok аккаунтов вы готовы вести одновременно?")
-    await state.set_state(Registration.accounts_count)
+    await message.answer("Сколько TikTok аккаунтов вы готовы держать?")
+    await state.set_state(WorkerReg.accounts)
 
-@dp.message(Registration.accounts_count)
-async def reg_accounts(message: Message, state: FSMContext):
+@dp.message(WorkerReg.accounts)
+async def worker_accs_step(message: Message, state: FSMContext):
     if not message.text.isdigit():
-        await message.answer("Укажите число:")
+        await message.answer("Введите количество числом:")
         return
-
     accs = int(message.text)
     data = await state.get_data()
     await state.clear()
 
-    async with aiosqlite.connect(DB_NAME) as db:
+    uid = message.from_user.id
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "UPDATE users SET tt_username = ?, age = ?, accounts_count = ?, status = 'pending' WHERE user_id = ?",
-            (data['tt_username'], data['age'], accs, message.from_user.id)
+            (data['tt_username'], data['age'], accs, uid)
         )
         await db.commit()
 
-    await message.answer("✅ Заявка отправлена модератору на проверку!")
+    await message.answer("✅ Ваша анкета отправлена на проверку модератору!")
 
-    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Принять", callback_data=f"appr_user_{message.from_user.id}"),
-            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"decl_user_{message.from_user.id}")
-        ]
-    ])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Принять", callback_data=f"usr_ok_{uid}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"usr_no_{uid}")
+    ]])
     await bot.send_message(
         ADMIN_ID,
         f"📝 <b>Новая заявка воркера:</b>\n"
-        f"TG: @{message.from_user.username or 'без_юзернейма'} (ID: <code>{message.from_user.id}</code>)\n"
-        f"TikTok: {data['tt_username']}\n"
+        f"TG: @{message.from_user.username or 'без_юзернейма'} (<code>{uid}</code>)\n"
+        f"TikTok: <code>{data['tt_username']}</code>\n"
         f"Возраст: {data['age']}\n"
         f"Аккаунтов: {accs}",
-        reply_markup=admin_kb,
+        reply_markup=kb,
         parse_mode="HTML"
     )
 
-@dp.callback_query(F.data.startswith("appr_user_"))
-async def admin_approve_user(callback: CallbackQuery):
-    target_id = int(callback.data.split("_")[2])
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET status = 'approved' WHERE user_id = ?", (target_id,))
+@dp.callback_query(F.data.startswith("usr_ok_"))
+async def adm_approve_user(call: CallbackQuery):
+    uid = int(call.data.split("_")[2])
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET status = 'approved' WHERE user_id = ?", (uid,))
         await db.commit()
+    await call.message.edit_text(call.message.text + "\n\n✅ <b>ОДОБРЕН</b>", parse_mode="HTML")
+    await bot.send_message(uid, "🎉 Ваша анкета одобрена! Теперь вам доступен весь функционал.", reply_markup=main_kb(uid))
 
-    await callback.message.edit_text(callback.message.text + "\n\n✅ <b>Одобрен</b>", parse_mode="HTML")
-    await bot.send_message(target_id, "🎉 Ваша заявка одобрена! Ознакомьтесь с гайдом перед отправкой видео.", reply_markup=main_kb(target_id))
-
-@dp.callback_query(F.data.startswith("decl_user_"))
-async def admin_decline_user(callback: CallbackQuery):
-    target_id = int(callback.data.split("_")[2])
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET status = 'rejected' WHERE user_id = ?", (target_id,))
+@dp.callback_query(F.data.startswith("usr_no_"))
+async def adm_reject_user(call: CallbackQuery):
+    uid = int(call.data.split("_")[2])
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET status = 'rejected' WHERE user_id = ?", (uid,))
         await db.commit()
-
-    await callback.message.edit_text(callback.message.text + "\n\n❌ <b>Отклонен</b>", parse_mode="HTML")
-    await bot.send_message(target_id, "❌ Ваша анкета отклонена модератором.")
-
-# ----------------- ПРОСМОТР ГАЙДА ВОРКЕРАМИ ----------------- #
-@dp.message(F.text == "📚 Гайд по видео")
-async def show_guide(message: Message):
-    guide_text = await get_setting("guide_text")
-    await message.answer(guide_text, reply_markup=guide_inline_kb(), parse_mode="HTML", disable_web_page_preview=True)
-
-@dp.callback_query(F.data == "show_wm_info")
-async def callback_show_wm_info(callback: CallbackQuery):
-    wm_text = await get_setting("wm_text")
-    wm_photo = await get_setting("wm_photo")
-
-    caption = (
-        f"🏷 <b>Информация о водяном знаке (Watermark):</b>\n\n"
-        f"Текст/тег знака:\n<code>{wm_text}</code>\n\n"
-        f"⚠️ Обязательно накладывайте его на каждый ролик перед публикацией."
-    )
-    if wm_photo:
-        await callback.message.answer_photo(photo=wm_photo, caption=caption, parse_mode="HTML")
-    else:
-        await callback.message.answer(caption, parse_mode="HTML")
-    await callback.answer()
-
-@dp.callback_query(F.data == "show_examples_info")
-async def callback_show_examples(callback: CallbackQuery):
-    views_photo = await get_setting("example_views_photo")
-    likes_photo = await get_setting("example_likes_photo")
-
-    if not views_photo and not likes_photo:
-        await callback.answer("Администратор еще не загрузил образцы скриншотов.", show_alert=True)
-        return
-
-    if views_photo:
-        await callback.message.answer_photo(photo=views_photo, caption="📊 <b>Пример правильного скриншота просмотров</b>\nДолжно быть четко видно число просмотров и аккаунт.", parse_mode="HTML")
-    if likes_photo:
-        await callback.message.answer_photo(photo=likes_photo, caption="❤️ <b>Пример правильного скриншота лайков</b>\nДолжно быть четко видно количество отметок «Нравится».", parse_mode="HTML")
-    await callback.answer()
-
-# ----------------- АДМИН-ПАНЕЛЬ УПРАВЛЕНИЯ ГАЙДАМИ ----------------- #
-@dp.message(F.text == "⚙️ Админ-панель гайдов")
-@dp.message(Command("admin"))
-async def cmd_admin_guides(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    await message.answer(
-        "🛠 <b>Управление гайдами и регламентом:</b>\n\n"
-        "Выберите раздел, который хотите обновить:",
-        reply_markup=admin_guides_menu_kb(),
-        parse_mode="HTML"
-    )
-
-@dp.callback_query(F.data == "adm_edit_guide_text")
-async def adm_edit_guide_start(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    current_text = await get_setting("guide_text")
-    await callback.message.answer(
-        f"Текущий текст гайда:\n\n{current_text}\n\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"Отправьте сообщением <b>новый текст регламента</b> (поддерживается HTML-разметка):",
-        parse_mode="HTML"
-    )
-    await state.set_state(AdminSettingsState.waiting_guide_text)
-    await callback.answer()
-
-@dp.message(AdminSettingsState.waiting_guide_text)
-async def adm_save_guide_text(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
-        return
-    await update_setting("guide_text", message.text)
-    await state.clear()
-    await message.answer("✅ Основной текст регламента успешно обновлен!", reply_markup=main_kb(ADMIN_ID))
-
-@dp.callback_query(F.data == "adm_edit_wm_text")
-async def adm_edit_wm_start(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    cur_wm = await get_setting("wm_text")
-    await callback.message.answer(
-        f"Текущий вотермарк: <code>{cur_wm}</code>\n\n"
-        f"Отправьте новый текст/тег водяного знака:",
-        parse_mode="HTML"
-    )
-    await state.set_state(AdminSettingsState.waiting_wm_text)
-    await callback.answer()
-
-@dp.message(AdminSettingsState.waiting_wm_text)
-async def adm_save_wm_text(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
-        return
-    await update_setting("wm_text", message.text.strip())
-    await state.clear()
-    await message.answer("✅ Текст водяного знака обновлен!", reply_markup=main_kb(ADMIN_ID))
-
-@dp.callback_query(F.data == "adm_upload_wm_photo")
-async def adm_upload_wm_photo_start(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    await callback.message.answer("Отправьте фото или логотип водяного знака, который воркеры должны накладывать:")
-    await state.set_state(AdminSettingsState.waiting_wm_photo)
-    await callback.answer()
-
-@dp.message(AdminSettingsState.waiting_wm_photo, F.photo)
-async def adm_save_wm_photo(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
-        return
-    photo_id = message.photo[-1].file_id
-    await update_setting("wm_photo", photo_id)
-    await state.clear()
-    await message.answer("✅ Картинка водяного знака сохранена!", reply_markup=main_kb(ADMIN_ID))
-
-@dp.callback_query(F.data == "adm_upload_views_sample")
-async def adm_upload_views_sample_start(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    await callback.message.answer("Отправьте фото-образец скриншота просмотров:")
-    await state.set_state(AdminSettingsState.waiting_views_sample)
-    await callback.answer()
-
-@dp.message(AdminSettingsState.waiting_views_sample, F.photo)
-async def adm_save_views_sample(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
-        return
-    photo_id = message.photo[-1].file_id
-    await update_setting("example_views_photo", photo_id)
-    await state.clear()
-    await message.answer("✅ Образец скриншота просмотров сохранен!", reply_markup=main_kb(ADMIN_ID))
-
-@dp.callback_query(F.data == "adm_upload_likes_sample")
-async def adm_upload_likes_sample_start(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    await callback.message.answer("Отправьте фото-образец скриншота лайков:")
-    await state.set_state(AdminSettingsState.waiting_likes_sample)
-    await callback.answer()
-
-@dp.message(AdminSettingsState.waiting_likes_sample, F.photo)
-async def adm_save_likes_sample(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
-        return
-    photo_id = message.photo[-1].file_id
-    await update_setting("example_likes_photo", photo_id)
-    await state.clear()
-    await message.answer("✅ Образец скриншота лайков сохранен!", reply_markup=main_kb(ADMIN_ID))
-
-# ----------------- ПРОФИЛЬ И РЕФЕРАЛЫ ----------------- #
-@dp.message(F.text == "ℹ️ Профиль")
-async def cmd_profile(message: Message):
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("SELECT balance, tt_username, status FROM users WHERE user_id = ?", (message.from_user.id,))
-        user = await cursor.fetchone()
-
-    if not user or user[2] != 'approved':
-        return
-
-    await message.answer(
-        f"👤 <b>Ваш профиль:</b>\n"
-        f"ID: <code>{message.from_user.id}</code>\n"
-        f"TikTok: {user[1]}\n"
-        f"Баланс: <b>${user[0]:.2f}</b>",
-        parse_mode="HTML"
-    )
-
-@dp.message(F.text == "👥 Реферальная система")
-async def cmd_refs(message: Message):
-    bot_me = await bot.get_me()
-    ref_link = f"https://t.me/{bot_me.username}?start={message.from_user.id}"
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("SELECT COUNT(*) FROM users WHERE referrer_id = ?", (message.from_user.id,))
-        refs_count = (await cursor.fetchone())[0]
-
-    await message.answer(
-        f"👥 <b>Реферальная программа (15%):</b>\n\n"
-        f"Вы получаете 15% от выплат каждого приглашенного воркера.\n\n"
-        f"Ваша партнерская ссылка:\n<code>{ref_link}</code>\n\n"
-        f"Приглашено рефералов: <b>{refs_count}</b>",
-        parse_mode="HTML"
-    )
+    await call.message.edit_text(call.message.text + "\n\n❌ <b>ОТКЛОНЕН</b>", parse_mode="HTML")
+    await bot.send_message(uid, "❌ Ваша заявка отклонена.")
 
 # ----------------- ОТЧЕТ ПО ВИДЕО ----------------- #
-@dp.message(F.text == "📹 Отправить отчет по видео")
+@dp.message(F.text == "📹 Сдать отчет")
 async def report_start(message: Message, state: FSMContext):
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("SELECT status FROM users WHERE user_id = ?", (message.from_user.id,))
-        user = await cursor.fetchone()
+    uid = message.from_user.id
+    async with aiosqlite.connect(DB_PATH) as db:
+        res = await db.execute("SELECT status FROM users WHERE user_id = ?", (uid,))
+        user = await res.fetchone()
+        if not user or user[0] != 'approved':
+            await message.answer("⚠️ Вы не можете сдавать отчеты без одобренной анкеты.")
+            return
 
-    if not user or user[0] != 'approved':
-        await message.answer("⚠️ Ваша заявка еще не одобрена.")
-        return
+        chk = await db.execute("SELECT id FROM reports WHERE user_id = ? AND status = 'pending'", (uid,))
+        if await chk.fetchone():
+            await message.answer("⏳ У вас уже есть отчет на проверке. Дождитесь его проверки модератором.")
+            return
 
-    await message.answer("Отправьте ссылку на ваше опубликованное видео в TikTok:")
-    await state.set_state(VideoReport.url)
+    await message.answer("Отправьте прямую ссылку на ваше опубликованное видео TikTok:", reply_markup=cancel_kb())
+    await state.set_state(ReportFSM.url)
 
-@dp.message(VideoReport.url)
+@dp.message(ReportFSM.url)
 async def report_url(message: Message, state: FSMContext):
-    if not message.text.startswith("http"):
-        await message.answer("Отправьте валидную ссылку (начинается с http/https):")
+    url = message.text.strip()
+    if not url.startswith("http"):
+        await message.answer("Отправьте корректную ссылку:")
         return
+    await state.update_data(video_url=url)
+    await message.answer("Прикрепите скриншот <b>просмотров</b> из аналитики:", parse_mode="HTML")
+    await state.set_state(ReportFSM.views_photo)
 
-    await state.update_data(video_url=message.text.strip())
-    await message.answer("Отправьте скриншот просмотров из аналитики видео:")
-    await state.set_state(VideoReport.views_photo)
-
-@dp.message(VideoReport.views_photo, F.photo)
-async def report_views_photo(message: Message, state: FSMContext):
+@dp.message(ReportFSM.views_photo, F.photo)
+async def report_views(message: Message, state: FSMContext):
     photo_id = message.photo[-1].file_id
-    await state.update_data(views_photo_id=photo_id)
-    await message.answer("Теперь отправьте скриншот лайков:")
-    await state.set_state(VideoReport.likes_photo)
+    await state.update_data(views_photo=photo_id)
+    await message.answer("Теперь прикрепите скриншот <b>лайков</b>:", parse_mode="HTML")
+    await state.set_state(ReportFSM.likes_photo)
 
-@dp.message(VideoReport.likes_photo, F.photo)
-async def report_likes_photo(message: Message, state: FSMContext):
+@dp.message(ReportFSM.likes_photo, F.photo)
+async def report_likes(message: Message, state: FSMContext):
     photo_id = message.photo[-1].file_id
     data = await state.get_data()
     await state.clear()
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute(
-            "INSERT INTO video_reports (user_id, video_url, views_photo_id, likes_photo_id) VALUES (?, ?, ?, ?) RETURNING id",
-            (message.from_user.id, data['video_url'], data['views_photo_id'], photo_id)
+    uid = message.from_user.id
+    async with aiosqlite.connect(DB_PATH) as db:
+        res = await db.execute(
+            "INSERT INTO reports (user_id, video_url, views_photo, likes_photo) VALUES (?, ?, ?, ?) RETURNING id",
+            (uid, data['video_url'], data['views_photo'], photo_id)
         )
-        report_id = (await cursor.fetchone())[0]
+        rid = (await res.fetchone())[0]
         await db.commit()
 
-    await message.answer("✅ Отчет принят и отправлен на модерацию!", reply_markup=main_kb(message.from_user.id))
+    await message.answer("✅ Отчет отправлен на модерацию!", reply_markup=main_kb(uid))
 
-    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="💵 Начислить баланс", callback_data=f"pay_rep_{report_id}"),
-            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"rej_rep_{report_id}")
-        ]
-    ])
-
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="💵 Начислить", callback_data=f"rep_ok_{rid}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"rep_no_{rid}")
+    ]])
     await bot.send_message(
         ADMIN_ID,
-        f"📹 <b>Новый отчет #{report_id}</b>\n"
-        f"Воркер: @{message.from_user.username or 'без_юзернейма'} (ID: <code>{message.from_user.id}</code>)\n"
+        f"📹 <b>Новый отчет #{rid}</b>\n"
+        f"Воркер: @{message.from_user.username or 'нет'} (<code>{uid}</code>)\n"
         f"Ссылка: {data['video_url']}",
         parse_mode="HTML"
     )
-    await bot.send_photo(ADMIN_ID, photo=data['views_photo_id'], caption=f"Просмотры (Отчет #{report_id})")
-    await bot.send_photo(ADMIN_ID, photo=photo_id, caption=f"Лайки (Отчет #{report_id})", reply_markup=admin_kb)
+    await bot.send_photo(ADMIN_ID, photo=data['views_photo'], caption=f"Просмотры #{rid}")
+    await bot.send_photo(ADMIN_ID, photo=photo_id, caption=f"Лайки #{rid}", reply_markup=kb)
 
-# ----------------- МОДЕРАЦИЯ ОТЧЕТА ----------------- #
-@dp.callback_query(F.data.startswith("rej_rep_"))
-async def admin_reject_report(callback: CallbackQuery):
-    report_id = int(callback.data.split("_")[2])
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("SELECT user_id FROM video_reports WHERE id = ?", (report_id,))
-        rep = await cursor.fetchone()
-        await db.execute("UPDATE video_reports SET status = 'rejected' WHERE id = ?", (report_id,))
+@dp.callback_query(F.data.startswith("rep_no_"))
+async def adm_reject_report(call: CallbackQuery):
+    rid = int(call.data.split("_")[2])
+    async with aiosqlite.connect(DB_PATH) as db:
+        res = await db.execute("SELECT user_id, status FROM reports WHERE id = ?", (rid,))
+        row = await res.fetchone()
+        if not row or row[1] != 'pending':
+            await call.answer("Отчет уже обработан.", show_alert=True)
+            await call.message.delete_reply_markup()
+            return
+        await db.execute("UPDATE reports SET status = 'rejected' WHERE id = ?", (rid,))
         await db.commit()
 
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.answer(f"❌ Отчет #{report_id} отклонен.")
-    if rep:
-        await bot.send_message(rep[0], f"❌ Ваш отчет #{report_id} отклонен. Убедитесь, что соблюден регламент, водяной знак и скриншоты.")
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.message.answer(f"❌ Отчет #{rid} отклонен.")
+    await bot.send_message(row[0], f"❌ Ваш отчет #{rid} отклонен.")
 
-@dp.callback_query(F.data.startswith("pay_rep_"))
-async def admin_pay_report_start(callback: CallbackQuery, state: FSMContext):
-    report_id = int(callback.data.split("_")[2])
-    await state.update_data(report_id=report_id)
-    await callback.message.answer(f"Введите подтвержденное количество просмотров для отчета #{report_id}:")
-    await state.set_state(AdminReview.views)
+@dp.callback_query(F.data.startswith("rep_ok_"))
+async def adm_pay_report_start(call: CallbackQuery, state: FSMContext):
+    rid = int(call.data.split("_")[2])
+    async with aiosqlite.connect(DB_PATH) as db:
+        res = await db.execute("SELECT status FROM reports WHERE id = ?", (rid,))
+        row = await res.fetchone()
+        if not row or row[0] != 'pending':
+            await call.answer("Отчет уже обработан.", show_alert=True)
+            await call.message.delete_reply_markup()
+            return
 
-@dp.message(AdminReview.views)
-async def admin_review_views(message: Message, state: FSMContext):
+    await call.message.edit_reply_markup(reply_markup=None)
+    await state.update_data(report_id=rid)
+    await call.message.answer(f"Введите подтвержденное количество <b>просмотров</b> для отчета #{rid}:", parse_mode="HTML")
+    await state.set_state(AdminReviewFSM.views)
+
+@dp.message(AdminReviewFSM.views)
+async def adm_views_step(message: Message, state: FSMContext):
     if not message.text.isdigit():
-        await message.answer("Введите число просмотров:")
+        await message.answer("Введите целое число:")
         return
     await state.update_data(views=int(message.text))
-    await message.answer("Введите подтвержденное количество лайков:")
-    await state.set_state(AdminReview.likes)
+    await message.answer("Введите количество <b>лайков</b>:", parse_mode="HTML")
+    await state.set_state(AdminReviewFSM.likes)
 
-@dp.message(AdminReview.likes)
-async def admin_review_likes(message: Message, state: FSMContext):
+@dp.message(AdminReviewFSM.likes)
+async def adm_likes_step(message: Message, state: FSMContext):
     if not message.text.isdigit():
-        await message.answer("Введите число лайков:")
+        await message.answer("Введите число:")
         return
-
     data = await state.get_data()
     await state.clear()
 
+    rid = data['report_id']
     views = data['views']
     likes = int(message.text)
-    report_id = data['report_id']
+    earned = round((views / 1000.0) * 1.0, 2)
 
-    amount = round((views / 1000.0) * 1.0, 2)
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("SELECT user_id FROM video_reports WHERE id = ?", (report_id,))
-        rep = await cursor.fetchone()
-        if not rep:
-            await message.answer("Отчет не найден.")
+    async with aiosqlite.connect(DB_PATH) as db:
+        res = await db.execute("SELECT user_id, status FROM reports WHERE id = ?", (rid,))
+        rep = await res.fetchone()
+        if not rep or rep[1] != 'pending':
+            await message.answer("Отчет уже был закрыт.")
             return
 
-        worker_id = rep[0]
-        await db.execute("UPDATE video_reports SET status = 'approved' WHERE id = ?", (report_id,))
-        await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, worker_id))
+        w_uid = rep[0]
+        await db.execute("UPDATE reports SET status = 'approved' WHERE id = ?", (rid,))
+        await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (earned, w_uid))
 
-        ref_cursor = await db.execute("SELECT referrer_id FROM users WHERE user_id = ?", (worker_id,))
-        user_ref = await ref_cursor.fetchone()
-
-        if user_ref and user_ref[0]:
-            referrer_id = user_ref[0]
-            ref_payout = round(amount * 0.15, 2)
-            if ref_payout > 0:
-                await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (ref_payout, referrer_id))
+        # 15% Рефералу
+        ref_res = await db.execute("SELECT referrer_id FROM users WHERE user_id = ?", (w_uid,))
+        ref_row = await ref_res.fetchone()
+        if ref_row and ref_row[0]:
+            bonus = round(earned * 0.15, 2)
+            if bonus > 0:
+                await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (bonus, ref_row[0]))
                 await bot.send_message(
-                    referrer_id,
-                    f"🎁 <b>Реферальный бонус!</b>\nВам начислено <b>${ref_payout:.2f}</b> (15%) от видео реферала.",
+                    ref_row[0],
+                    f"🎁 <b>Реферальный бонус!</b> +${bonus:.2f} (15%) от работы реферала.",
                     parse_mode="HTML"
                 )
 
         await db.commit()
 
-    await message.answer(f"✅ Баланс воркера пополнен на ${amount:.2f}. Отчет #{report_id} закрыт.")
+    await message.answer(f"✅ Баланс воркера пополнен на ${earned:.2f}. Отчет #{rid} закрыт.")
     await bot.send_message(
-        worker_id,
-        f"🎉 <b>Отчет одобрен!</b>\n"
-        f"Просмотры: {views} | Лайки: {likes}\n"
-        f"Начислено: <b>${amount:.2f}</b>",
+        w_uid,
+        f"🎉 <b>Отчет одобрен!</b>\nПросмотры: {views} | Лайки: {likes}\nВам начислено: <b>${earned:.2f}</b>",
         parse_mode="HTML"
     )
 
 # ----------------- БАЛАНС И ВЫВОД ----------------- #
-@dp.message(F.text == "💰 Баланс и Вывод")
-async def cmd_balance(message: Message):
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("SELECT balance FROM users WHERE user_id = ?", (message.from_user.id,))
-        res = await cursor.fetchone()
+@dp.message(F.text == "💰 Баланс")
+async def balance_screen(message: Message):
+    uid = message.from_user.id
+    async with aiosqlite.connect(DB_PATH) as db:
+        res = await db.execute("SELECT balance FROM users WHERE user_id = ?", (uid,))
+        row = await res.fetchone()
+    bal = row[0] if row else 0.0
 
-    balance = res[0] if res else 0.0
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📤 Заказать вывод (от $5)", callback_data="start_withdraw")]
-    ])
-    await message.answer(
-        f"💰 Ваш баланс: <b>${balance:.2f}</b>\n\n"
-        f"Минимальная выплата: <b>$5.00</b>",
-        reply_markup=kb,
-        parse_mode="HTML"
-    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="💸 Вывести ($5+)", callback_data="start_withdraw")
+    ]])
+    await message.answer(f"💰 Ваш баланс: <b>${bal:.2f}</b>\nМинимум для вывода: $5.00", reply_markup=kb, parse_mode="HTML")
 
 @dp.callback_query(F.data == "start_withdraw")
-async def withdraw_start(callback: CallbackQuery, state: FSMContext):
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("SELECT balance FROM users WHERE user_id = ?", (callback.from_user.id,))
-        balance = (await cursor.fetchone())[0]
+async def withdraw_start(call: CallbackQuery, state: FSMContext):
+    uid = call.from_user.id
+    async with aiosqlite.connect(DB_PATH) as db:
+        res = await db.execute("SELECT balance FROM users WHERE user_id = ?", (uid,))
+        bal = (await res.fetchone())[0]
 
-    if balance < 5.0:
-        await callback.answer("❌ На балансе меньше $5. Вывод доступен от $5.", show_alert=True)
+    if bal < 5.0:
+        await call.answer("Минимальный баланс для вывода — $5.00", show_alert=True)
         return
 
-    await callback.message.edit_text("Выберите метод вывода:", reply_markup=withdraw_methods_kb())
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🇷🇺 Карта РФ (RUB)", callback_data="wm_rub")],
+        [InlineKeyboardButton(text="🇰🇿 Карта KZ (KZT)", callback_data="wm_kzt")],
+        [InlineKeyboardButton(text="💎 TON (Крипта)", callback_data="wm_ton")],
+        [InlineKeyboardButton(text="💵 USD", callback_data="wm_usd")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
+    ])
+    await call.message.edit_text("Выберите способ выплаты:", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("wm_"))
-async def withdraw_select_method(callback: CallbackQuery, state: FSMContext):
-    methods_dict = {
+async def withdraw_method(call: CallbackQuery, state: FSMContext):
+    methods = {
         "wm_rub": "Карта РФ (RUB)",
         "wm_kzt": "Карта KZ (KZT)",
-        "wm_ton": "Crypto TON",
+        "wm_ton": "TON (Крипта)",
         "wm_usd": "USD"
     }
-    method_name = methods_dict[callback.data]
-    await state.update_data(withdraw_method=method_name)
+    m = methods[call.data]
+    await state.update_data(method=m)
+    await call.message.edit_text(f"Способ: <b>{m}</b>\nВведите сумму вывода ($):", parse_mode="HTML")
+    await state.set_state(WithdrawFSM.amount)
 
-    await callback.message.edit_text(f"Метод: <b>{method_name}</b>\nВведите сумму вывода ($):", parse_mode="HTML")
-    await state.set_state(Withdrawal.amount)
-
-@dp.message(Withdrawal.amount)
+@dp.message(WithdrawFSM.amount)
 async def withdraw_amount(message: Message, state: FSMContext):
     try:
-        amount = float(message.text.replace(",", "."))
+        val = float(message.text.replace(",", "."))
     except ValueError:
         await message.answer("Введите сумму числом:")
         return
 
-    if amount < 5.0:
-        await message.answer("Минимальная сумма — $5. Введите сумму заново:")
+    if val < 5.0:
+        await message.answer("Минимум к выводу — $5.00:")
         return
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("SELECT balance FROM users WHERE user_id = ?", (message.from_user.id,))
-        balance = (await cursor.fetchone())[0]
+    uid = message.from_user.id
+    async with aiosqlite.connect(DB_PATH) as db:
+        res = await db.execute("SELECT balance FROM users WHERE user_id = ?", (uid,))
+        bal = (await res.fetchone())[0]
 
-    if amount > balance:
-        await message.answer(f"Недостаточно средств. Ваш баланс: ${balance:.2f}\nВведите корректную сумму:")
+    if val > bal:
+        await message.answer(f"Недостаточно средств. Ваш баланс: ${bal:.2f}. Введите корректную сумму:")
         return
 
-    await state.update_data(amount=amount)
-    await message.answer("Введите реквизиты (номер карты / адрес TON / номер счета):")
-    await state.set_state(Withdrawal.details)
+    await state.update_data(amount=val)
+    await message.answer("Введите реквизиты (номер карты, кошелька или адрес TON):")
+    await state.set_state(WithdrawFSM.details)
 
-@dp.message(Withdrawal.details)
+@dp.message(WithdrawFSM.details)
 async def withdraw_details(message: Message, state: FSMContext):
     details = message.text.strip()
     data = await state.get_data()
     amount = data['amount']
-    method = data['withdraw_method']
+    method = data['method']
     await state.clear()
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (amount, message.from_user.id))
-        cursor = await db.execute(
+    uid = message.from_user.id
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (amount, uid))
+        ins = await db.execute(
             "INSERT INTO withdrawals (user_id, amount, method, details) VALUES (?, ?, ?, ?) RETURNING id",
-            (message.from_user.id, amount, method, details)
+            (uid, amount, method, details)
         )
-        withdraw_id = (await cursor.fetchone())[0]
+        wid = (await ins.fetchone())[0]
         await db.commit()
 
     await message.answer(
-        f"✅ <b>Заявка на вывод #{withdraw_id} принята!</b>\n"
-        f"Сумма: ${amount:.2f}\n"
-        f"Метод: {method}\n"
-        f"Реквизиты: {details}\n\n"
-        f"Ожидайте зачисления средств.",
-        reply_markup=main_kb(message.from_user.id),
+        f"✅ <b>Заявка #{wid} принята!</b>\nСумма: ${amount:.2f}\nМетод: {method}\nРеквизиты: <code>{details}</code>",
+        reply_markup=main_kb(uid),
         parse_mode="HTML"
     )
 
-    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Выплачено", callback_data=f"done_wdr_{withdraw_id}")]
-    ])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Выплачено", callback_data=f"wdr_ok_{wid}")
+    ]])
     await bot.send_message(
         ADMIN_ID,
-        f"💸 <b>Заявка на вывод #{withdraw_id}</b>\n\n"
-        f"Воркер: @{message.from_user.username or 'без_юзернейма'} (ID: <code>{message.from_user.id}</code>)\n"
+        f"💸 <b>Заявка на вывод #{wid}</b>\n"
+        f"Воркер: @{message.from_user.username or 'нет'} (<code>{uid}</code>)\n"
         f"Сумма: <b>${amount:.2f}</b>\n"
-        f"Метод: <b>{method}</b>\n"
-        f"Реквизиты: <code>{details}</code>",
-        reply_markup=admin_kb,
+        f"Метод: {method}\nРеквизиты: <code>{details}</code>",
+        reply_markup=kb,
         parse_mode="HTML"
     )
 
-@dp.callback_query(F.data.startswith("done_wdr_"))
-async def admin_complete_withdraw(callback: CallbackQuery):
-    w_id = int(callback.data.split("_")[2])
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("SELECT user_id, amount, method FROM withdrawals WHERE id = ?", (w_id,))
-        res = await cursor.fetchone()
-        await db.execute("UPDATE withdrawals SET status = 'completed' WHERE id = ?", (w_id,))
+@dp.callback_query(F.data.startswith("wdr_ok_"))
+async def adm_payout_complete(call: CallbackQuery):
+    wid = int(call.data.split("_")[2])
+    async with aiosqlite.connect(DB_PATH) as db:
+        res = await db.execute("SELECT user_id, amount, method, status FROM withdrawals WHERE id = ?", (wid,))
+        row = await res.fetchone()
+        if not row or row[3] != 'pending':
+            await call.answer("Заявка уже закрыта.", show_alert=True)
+            await call.message.delete_reply_markup()
+            return
+        await db.execute("UPDATE withdrawals SET status = 'paid' WHERE id = ?", (wid,))
         await db.commit()
 
-    await callback.message.edit_text(callback.message.text + "\n\n✅ <b>ВЫПЛАЧЕНО</b>", parse_mode="HTML")
-    if res:
-        await bot.send_message(
-            res[0],
-            f"✅ <b>Выплата выполнена!</b>\nСредства (${res[1]:.2f}) отправлены на {res[2]}.",
-            parse_mode="HTML"
-        )
+    await call.message.edit_text(call.message.text + "\n\n✅ <b>ВЫПЛАЧЕНО</b>", parse_mode="HTML")
+    await bot.send_message(row[0], f"✅ <b>Выплата выполнена!</b>\nВам отправлено ${row[1]:.2f} на {row[2]}.", parse_mode="HTML")
+
+# ----------------- ПРОФИЛЬ И РЕФЕРАЛКА ----------------- #
+@dp.message(F.text == "👤 Профиль")
+async def profile_view(message: Message):
+    uid = message.from_user.id
+    async with aiosqlite.connect(DB_PATH) as db:
+        res = await db.execute("SELECT balance, tt_username FROM users WHERE user_id = ?", (uid,))
+        row = await res.fetchone()
+    if not row:
+        return
+    await message.answer(
+        f"👤 <b>Ваш профиль:</b>\n"
+        f"ID: <code>{uid}</code>\n"
+        f"TikTok: <code>{row[1] or 'Не указан'}</code>\n"
+        f"Баланс: <b>${row[0]:.2f}</b>",
+        parse_mode="HTML"
+    )
+
+@dp.message(F.text == "👥 Рефералка")
+async def refs_view(message: Message):
+    uid = message.from_user.id
+    b = await bot.get_me()
+    ref_link = f"https://t.me/{b.username}?start={uid}"
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        res = await db.execute("SELECT COUNT(*) FROM users WHERE referrer_id = ?", (uid,))
+        cnt = (await res.fetchone())[0]
+
+    await message.answer(
+        f"👥 <b>Реферальная программа (15%)</b>\n\n"
+        f"Получайте 15% с каждой выплаты приведенного воркера.\n\n"
+        f"Ваша ссылка:\n<code>{ref_link}</code>\n\n"
+        f"Приглашено рефералов: <b>{cnt}</b>",
+        parse_mode="HTML"
+    )
 
 @dp.callback_query(F.data == "cancel_action")
-async def cancel_callback(callback: CallbackQuery, state: FSMContext):
+async def cancel_handler(call: CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.delete()
-    await callback.message.answer("Действие отменено.", reply_markup=main_kb(callback.from_user.id))
+    await call.message.delete()
+    await call.message.answer("Действие отменено.", reply_markup=main_kb(call.from_user.id))
 
 # ----------------- ЗАПУСК ----------------- #
 async def main():
